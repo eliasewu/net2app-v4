@@ -1,0 +1,81 @@
+name: Deploy to Production Server
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-server
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Install SSH key
+        uses: shimataro/ssh-key-action@v2
+        with:
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          known_hosts: ${{ secrets.SSH_KNOWN_HOSTS }}
+
+      - name: Ensure target directory exists on server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: mkdir -p ${{ secrets.APP_DIR || '/opt/net2app-hub' }}
+
+      - name: Sync files to server via rsync
+        run: |
+          rsync -avz --delete \
+            --exclude='node_modules' \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='src' \
+            --exclude='*.ts' \
+            --exclude='*.tsx' \
+            --exclude='*.log' \
+            --exclude='.env' \
+            -e "ssh -p ${{ secrets.SSH_PORT || 22 }}" \
+            ./ ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ secrets.APP_DIR || '/opt/net2app-hub' }}/
+
+      - name: Restart service on server
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          script: |
+            set -e
+            cd ${{ secrets.APP_DIR || '/opt/net2app-hub' }}
+            npm config set user 0 2>/dev/null || true
+            echo "==> Installing dependencies..."
+            npm install --no-audit --no-fund 2>/dev/null || true
+            echo "==> Restarting service..."
+            sudo systemctl daemon-reload 2>/dev/null || true
+            sudo systemctl restart net2app-hub 2>/dev/null || nohup node server.cjs > /tmp/net2app-hub.log 2>&1 &
+            echo "==> Done!"
+            echo "  PID: $(pgrep -f 'node server.cjs' 2>/dev/null || echo 'checking...')"
